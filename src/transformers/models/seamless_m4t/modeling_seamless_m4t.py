@@ -2147,6 +2147,10 @@ class SeamlessM4TTextToUnitModel(SeamlessM4TPreTrainedModel):
         )
 
 
+
+
+
+
 @add_start_docstrings(
     "Transformer text-to-unit encoder-decoder with a language model head. The base encoder-decoder model is a [`SeamlessM4TTextToUnit`].",
     SEAMLESS_M4T_START_DOCSTRING,
@@ -2154,6 +2158,7 @@ class SeamlessM4TTextToUnitModel(SeamlessM4TPreTrainedModel):
         embed_tokens_decoder (`nn.Embedding`, *optional*): input embedding of the decoder.
     """,
 )
+
 class SeamlessM4TTextToUnitForConditionalGeneration(SeamlessM4TPreTrainedModel, GenerationMixin):
     _keys_to_ignore_on_load_missing = [
         "vocoder",
@@ -2285,7 +2290,239 @@ class SeamlessM4TTextToUnitForConditionalGeneration(SeamlessM4TPreTrainedModel, 
             if output_embeddings is not None:
                 self._tie_or_clone_weights(output_embeddings, self.get_input_embeddings())
 
+class SeamlessM4TTextToUnitForConditionalGenerationWithEmotionEmbedding(SeamlessM4TTextToUnitForConditionalGeneration):
+    def __init__(
+        self,
+        config: SeamlessM4TConfig,
+        embed_tokens_decoder: Optional[nn.Embedding] = None,
+    ):
+        super().__init__(config, embed_tokens_decoder)
 
+        self.emotion_embedding_proj = nn.Linear(config.hidden_size, config.hidden_size)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.LongTensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        emotion_embedding: Optional[torch.FloatTensor] = None,  # 新增的输入
+    ) -> Union[Seq2SeqLMOutput, Tuple[torch.FloatTensor]]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if inputs_embeds is None:
+            inputs_embeds = self.model.encoder.embed_tokens(input_ids)
+
+        if emotion_embedding is not None:
+            emotion_embedding = self.emotion_embedding_proj(emotion_embedding)  
+            inputs_embeds = inputs_embeds + emotion_embedding 
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            encoder_outputs=encoder_outputs,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        # 
+        lm_logits = self.lm_head(outputs[0])
+
+        masked_lm_loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            labels = labels.to(lm_logits.device)
+            masked_lm_loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (lm_logits,) + outputs[1:]
+            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+
+        return Seq2SeqLMOutput(
+            loss=masked_lm_loss,
+            logits=lm_logits,
+            past_key_values=outputs.past_key_values,
+            decoder_hidden_states=outputs.decoder_hidden_states,
+            decoder_attentions=outputs.decoder_attentions,
+            cross_attentions=outputs.cross_attentions,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attentions=outputs.encoder_attentions,
+        )
+
+
+class SeamlessM4TTextToUnitForConditionalGenerationWithEmoSphere(SeamlessM4TTextToUnitForConditionalGeneration):
+    def __init__(
+        self,
+        config: SeamlessM4TConfig,
+        embed_tokens_decoder: Optional[nn.Embedding] = None,
+    ):
+        super().__init__(config, embed_tokens_decoder)
+
+        self.emotion_embedding_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.emo_VAD_inten_proj = nn.Linear(1, config.hidden_size, bias=True)
+        self.emosty_layer_norm = nn.LayerNorm(config.hidden_size)
+        
+        self.sty_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+        
+        self.azimuth_bins = nn.Parameter(torch.linspace(-np.pi/2, np.pi, 4), requires_grad=False)
+        self.azimuth_emb = torch.nn.Embedding(4, config.hidden_size // 2)
+        self.elevation_bins = nn.Parameter(torch.linspace(np.pi/2, np.pi, 2), requires_grad=False)
+        self.elevation_emb = torch.nn.Embedding(2, config.hidden_size // 2)
+        
+        self.spk_embed_proj = nn.Linear(512, config.hidden_size, bias=True)
+        self.emo_proj = nn.Linear(768, config.hidden_size, bias=True)
+
+        self.emo_mlp = torch.nn.Sequential(
+            torch.nn.Linear(768, 1024),
+            Mish(),
+            torch.nn.Linear(1024, config.hidden_size),
+        )
+
+        # Initialize weights and apply final processing
+        self.post_init()
+    def _process_embeddings(self, embedding, low_level_emo_embedding, emotion_embedding):
+        # xvec projection
+        embedding = F.normalize(embedding, dim=1)
+        embedding = self.spk_embed_affine_layer(embedding)
+        emos_proj_embed = self.emo_mlp(emotion_embedding)
+        intens_embed = self.emo_VAD_inten_proj(low_level_emo_embedding[:, 0:1])
+        # style_vector=style_vector.squeeze(1) 
+        ele_embed = 0
+        elevation = low_level_emo_embedding[:, 1:2]
+        elevation_index = torch.bucketize(elevation, self.elevation_bins)
+        elevation_index = elevation_index.squeeze(1)
+        elevation_embed = self.elevation_emb(elevation_index)
+        ele_embed = elevation_embed + ele_embed
+        azi_embed = 0
+        azimuth = low_level_emo_embedding[:, 2:3]   #提取仰角和方位
+        azimuth_index = torch.bucketize(azimuth, self.azimuth_bins)
+        azimuth_index = azimuth_index.squeeze(1)
+        azimuth_embed = self.azimuth_emb(azimuth_index)
+        azi_embed = azimuth_embed + azi_embed # [11, 96]
+        
+        style_embed = torch.cat((ele_embed, azi_embed), dim=-1) # 192
+        style_proj_embed = self.sty_proj(style_embed)  # 192
+        
+        # Softplus+
+        combined_embedding = torch.cat((emos_proj_embed, style_proj_embed), dim=-1)  # 384
+        emotion_embedding = F.softplus(combined_embedding)
+        emosty_embed = self.emosty_layer_norm(emotion_embedding)
+        emo_all_emb = (intens_embed + emosty_embed) # torch.Size([11, 384])
+        embedding = torch.cat((embedding, emo_all_emb), dim=-1)  # torch.Size([11, 464])
+        
+        return embedding
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.LongTensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        low_level_emotion_embedding: Optional[torch.FloatTensor] = None, 
+        high_level_emotion_embedding: Optional[torch.FloatTensor] = None, 
+    ) -> Union[Seq2SeqLMOutput, Tuple[torch.FloatTensor]]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        emos_proj_embed = self.emo_mlp(high_level_emotion_embedding)
+        intens_embed = self.emo_VAD_inten_proj(low_level_emo_embedding[:, 0:1])
+        ele_embed = 0
+        elevation = low_level_emo_embedding[:, 1:2]
+        elevation_index = torch.bucketize(elevation, self.elevation_bins)
+        elevation_index = elevation_index.squeeze(1)
+        elevation_embed = self.elevation_emb(elevation_index)
+        ele_embed = elevation_embed + ele_embed
+        azi_embed = 0
+        azimuth = low_level_emo_embedding[:, 2:3]   #提取仰角和方位
+        azimuth_index = torch.bucketize(azimuth, self.azimuth_bins)
+        azimuth_index = azimuth_index.squeeze(1)
+        azimuth_embed = self.azimuth_emb(azimuth_index)
+        azi_embed = azimuth_embed + azi_embed # [11, 96]
+        
+        style_embed = torch.cat((ele_embed, azi_embed), dim=-1) # 192
+        style_proj_embed = self.sty_proj(style_embed)  # 192
+        
+        # Softplus+
+        combined_embedding = torch.cat((emos_proj_embed, style_proj_embed), dim=-1)  # 384
+        emotion_embedding = F.softplus(combined_embedding)
+        emosty_embed = self.emosty_layer_norm(emotion_embedding)
+        emo_all_emb = (intens_embed + emosty_embed) # torch.Size([11, 384])
+
+
+        if inputs_embeds is None:
+            inputs_embeds = self.model.encoder.embed_tokens(input_ids)
+
+        if emotion_embedding is not None:
+            emotion_embedding = self.emotion_embedding_proj(emo_all_emb)  
+            inputs_embeds = inputs_embeds + emotion_embedding 
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            encoder_outputs=encoder_outputs,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        # 
+        lm_logits = self.lm_head(outputs[0])
+
+        masked_lm_loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            labels = labels.to(lm_logits.device)
+            masked_lm_loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (lm_logits,) + outputs[1:]
+            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+
+        return Seq2SeqLMOutput(
+            loss=masked_lm_loss,
+            logits=lm_logits,
+            past_key_values=outputs.past_key_values,
+            decoder_hidden_states=outputs.decoder_hidden_states,
+            decoder_attentions=outputs.decoder_attentions,
+            cross_attentions=outputs.cross_attentions,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attentions=outputs.encoder_attentions,
+        )
 ############ VOCODER related code ################
 
 
@@ -2638,6 +2875,221 @@ class SeamlessM4TCodeHifiGan(PreTrainedModel):
             layer.remove_weight_norm()
         nn.utils.remove_weight_norm(self.hifi_gan.conv_post)
 
+
+class SeamlessM4TCodeHifiGanWithEmotion(SeamlessM4TCodeHifiGan):
+    def __init__(self, config):
+        super().__init__(config)
+
+        # 添加 emotion embedding 和线性层
+        # self.emotion_embedding = nn.Embedding(config.num_emotions, config.emotion_embed_dim)
+        self.emotion_proj = nn.Linear(config.emotion_embed_dim, config.spkr_embed_dim)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        spkr_id: torch.Tensor,
+        lang_id: torch.Tensor,
+        emotion_embedding: torch.Tensor,  
+    ) -> Tuple[torch.Tensor]:
+        """
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary.
+            spkr_id (`torch.Tensor` of shape `(batch_size,)`):
+                The id of the speaker used for speech synthesis.
+            lang_id (`torch.Tensor` of shape `(batch_size,)`):
+                The id of the language used for speech synthesis.
+            emotion_embedding (`torch.Tensor` of shape `(batch_size,)`):  
+                The id of the emotion used for speech synthesis.
+        """
+        hidden_states = self.unit_embedding(input_ids).transpose(1, 2)
+
+        spkr = self.speaker_embedding(spkr_id).transpose(1, 2)
+        lang = self.language_embedding(lang_id).transpose(1, 2)
+
+        # emotion = self.emotion_embedding(emotion_embedding).transpose(1, 2)
+        emotion = self.emotion_proj(emotion_embedding)  
+
+        spkr += emotion
+
+        log_dur_pred = self.dur_predictor(hidden_states.transpose(1, 2))
+        dur_out = torch.clamp(torch.round((torch.exp(log_dur_pred) - 1)).long(), min=1)
+
+        if hidden_states.size(0) == 1:
+            hidden_states = torch.repeat_interleave(hidden_states, dur_out.view(-1), dim=2)
+        else:
+            if hidden_states.shape[0] > 1 and self.training:
+                logger.warning(
+                    """`self.training=True` and you use batching. You lose parallelism during the hifigan
+                               forward pass because the samples are interleaved."""
+                )
+            hidden_states = [
+                torch.repeat_interleave(hidden_state, duration, dim=-1).transpose(0, 1)
+                for (hidden_state, duration) in zip(hidden_states, dur_out)
+            ]
+            hidden_states = nn.utils.rnn.pad_sequence(hidden_states, batch_first=True).transpose(1, 2)
+
+        spkr = spkr.repeat(1, 1, hidden_states.shape[-1])
+        lang = lang.repeat(1, 1, hidden_states.shape[-1])
+        hidden_states = torch.cat([lang, hidden_states, spkr], dim=1)
+
+        hidden_states = self.hifi_gan(hidden_states)
+
+        unit_lengths = self._get_dur_output_lengths(input_ids, dur_out)
+        lengths = self._get_output_hifigan_lengths(unit_lengths)
+
+        return hidden_states, lengths
+
+class SeamlessM4TCodeHifiGanWithEmoSphere(SeamlessM4TCodeHifiGan):
+    def __init__(self, config):
+        super().__init__(config)
+        # self.Lort_losss = False
+        # self.cross_loss = False
+        self.emo_VAD_inten_proj = nn.Linear(1, config.spkr_embed_dim, bias=True)
+        self.emosty_layer_norm = nn.LayerNorm(config.spkr_embed_dim)
+        
+        self.emotion_proj = nn.Linear(config.emotion_embed_dim, config.spkr_embed_dim)
+        self.sty_proj = nn.Linear(config.spkr_embed_dim, config.spkr_embed_dim, bias=True)
+        
+        self.azimuth_bins = nn.Parameter(torch.linspace(-np.pi/2, np.pi, 4), requires_grad=False)
+        self.azimuth_emb = torch.nn.Embedding(4, config.spkr_embed_dim // 2)
+        self.elevation_bins = nn.Parameter(torch.linspace(np.pi/2, np.pi, 2), requires_grad=False)
+        self.elevation_emb = torch.nn.Embedding(2, config.spkr_embed_dim // 2)
+        
+        self.spk_embed_proj = nn.Linear(512, config.spkr_embed_dim, bias=True)
+        self.emo_proj = nn.Linear(768, config.spkr_embed_dim, bias=True)
+
+        # self.spk_mlp = torch.nn.Sequential(
+        #     torch.nn.Linear(512, 1024),
+        #     Mish(),
+        #     torch.nn.Linear(1024, config.spkr_embed_dim),
+        # )
+        # if self.Lort_losss:
+        #     # print("self.Lort_losss:", self.Lort_losss)
+        #     self.map_speaker_embedding = torch.nn.Linear(output_size, config.spkr_embed_dim)
+        self.emo_mlp = torch.nn.Sequential(
+            torch.nn.Linear(768, 1024),
+            Mish(),
+            torch.nn.Linear(1024, config.spkr_embed_dim),
+        )
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        spkr_id: torch.Tensor,
+        lang_id: torch.Tensor,
+        low_level_emotion_embedding: torch.Tensor,  
+        high_level_emotion_embedding: torch.Tensor, 
+    ) -> Tuple[torch.Tensor]:
+        """
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary.
+            spkr_id (`torch.Tensor` of shape `(batch_size,)`):
+                The id of the speaker used for speech synthesis.
+            lang_id (`torch.Tensor` of shape `(batch_size,)`):
+                The id of the language used for speech synthesis.
+            emotion_embedding (`torch.Tensor` of shape `(batch_size,)`):  
+                The id of the emotion used for speech synthesis.
+
+        """
+        
+        hidden_states = self.unit_embedding(input_ids).transpose(1, 2)
+
+        spkr = self.speaker_embedding(spkr_id).transpose(1, 2)
+        lang = self.language_embedding(lang_id).transpose(1, 2)
+
+        if orth_loss:
+            self.speaker_projector = nn.Linear(spkr.shape[-1], spkr.shape[-1])
+            self.emotion_projector = nn.Linear(spkr.shape[-1], spkr.shape[-1])
+
+
+        emos_proj_embed = self.emo_mlp(emotion_embedding)
+        
+        intens_embed = self.emo_VAD_inten_proj(low_level_emo_embedding[:, 0:1])
+        # style_vector=style_vector.squeeze(1) 
+        ele_embed = 0
+        elevation = low_level_emo_embedding[:, 1:2]
+        elevation_index = torch.bucketize(elevation, self.elevation_bins)
+        elevation_index = elevation_index.squeeze(1)
+        elevation_embed = self.elevation_emb(elevation_index)
+        ele_embed = elevation_embed + ele_embed
+        azi_embed = 0
+        azimuth = low_level_emo_embedding[:, 2:3]   #提取仰角和方位
+        azimuth_index = torch.bucketize(azimuth, self.azimuth_bins)
+        azimuth_index = azimuth_index.squeeze(1)
+        azimuth_embed = self.azimuth_emb(azimuth_index)
+        azi_embed = azimuth_embed + azi_embed # [11, 96]
+        
+        style_embed = torch.cat((ele_embed, azi_embed), dim=-1) # 192
+        style_proj_embed = self.sty_proj(style_embed)  # 192
+        
+        # Softplus+
+        combined_embedding = torch.cat((emos_proj_embed, style_proj_embed), dim=-1)  # 384
+        emotion_embedding = F.softplus(combined_embedding)
+        emosty_embed = self.emosty_layer_norm(emotion_embedding)
+        emo_all_emb = (intens_embed + emosty_embed) # torch.Size([11, 384])
+        # embedding = torch.cat((spk_embedding, emo_all_emb), dim=-1)  # torch.Size([11, 464])
+
+        # emotion = self.emotion_embedding(emotion_embedding).transpose(1, 2)
+        emotion = self.emotion_proj(emo_all_emb)  
+
+        # if self.Lort_losss or self.cross_loss:
+        #     spkr = self.speaker_projector(spkr)
+        #     emotion = self.emotion_projector(emotion)
+        #     spkr += emotion
+        #     if self.cross_loss:
+        #         orth_loss = 0.0
+        #         batch_size = spkr.size(0)
+        #         # print("batch_size:", batch_size)
+        #         for i in range(batch_size):
+        #             for j in range(i + 1, batch_size):
+        #                 # 计算 embedding[i] 和 emotion_embedding[j] 之间的正交损失
+        #                 orth_loss += torch.abs(torch.dot(spkr[i], emotion[j]))
+        #         if batch_size == 1:
+        #             orth_loss = 0
+        #         else:
+        #             orth_loss /= (batch_size * (batch_size - 1)) / 2
+        #     else:
+        #         orth_loss = OrthogonalityLoss(spkr, emotion)
+        # else:
+        #     orth_loss = torch.tensor(0.0).to(device)  # 如果不启用正交损失，设置为 0
+
+        spkr += emotion
+
+        log_dur_pred = self.dur_predictor(hidden_states.transpose(1, 2))
+        dur_out = torch.clamp(torch.round((torch.exp(log_dur_pred) - 1)).long(), min=1)
+
+        if hidden_states.size(0) == 1:
+            hidden_states = torch.repeat_interleave(hidden_states, dur_out.view(-1), dim=2)
+        else:
+            if hidden_states.shape[0] > 1 and self.training:
+                logger.warning(
+                    """`self.training=True` and you use batching. You lose parallelism during the hifigan
+                               forward pass because the samples are interleaved."""
+                )
+            hidden_states = [
+                torch.repeat_interleave(hidden_state, duration, dim=-1).transpose(0, 1)
+                for (hidden_state, duration) in zip(hidden_states, dur_out)
+            ]
+            hidden_states = nn.utils.rnn.pad_sequence(hidden_states, batch_first=True).transpose(1, 2)
+
+        spkr = spkr.repeat(1, 1, hidden_states.shape[-1])
+        lang = lang.repeat(1, 1, hidden_states.shape[-1])
+        hidden_states = torch.cat([lang, hidden_states, spkr], dim=1)
+
+        hidden_states = self.hifi_gan(hidden_states)
+
+        unit_lengths = self._get_dur_output_lengths(input_ids, dur_out)
+        lengths = self._get_output_hifigan_lengths(unit_lengths)
+
+        return hidden_states, lengths
 
 ############ WHOLE MODEL related code ################
 
