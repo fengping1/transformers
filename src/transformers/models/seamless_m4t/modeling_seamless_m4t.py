@@ -2147,6 +2147,10 @@ class SeamlessM4TTextToUnitModel(SeamlessM4TPreTrainedModel):
         )
 
 
+class SeamlessM4TTextToUnitForConditionalGenerationWithSpeakerEmbedding(SeamlessM4TTextToUnitForConditionalGeneration):
+
+
+
 @add_start_docstrings(
     "Transformer text-to-unit encoder-decoder with a language model head. The base encoder-decoder model is a [`SeamlessM4TTextToUnit`].",
     SEAMLESS_M4T_START_DOCSTRING,
